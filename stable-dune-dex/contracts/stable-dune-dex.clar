@@ -16,6 +16,8 @@
 (define-constant ERR-INVALID-AMOUNT (err u112))
 (define-constant ERR-YIELD-SCORE-TOO-LOW (err u113))
 (define-constant ERR-VAULT-ALREADY-EXECUTED (err u114))
+(define-constant ERR-MILESTONE-ALREADY-COMPLETED (err u115))
+(define-constant ERR-INVALID-MILESTONE (err u116))
 
 ;; Constants
 (define-constant PROTOCOL-OWNER tx-sender)
@@ -210,6 +212,28 @@
                 consistency-score: (+ (get consistency-score current-data) u1)
             }
         )
+        (ok true)
+    )
+)
+
+(define-private (update-yield-reputation (user principal) (successful bool))
+    (let ((current-rep (get-yield-reputation user)))
+        (map-set yield-reputation { user: user }
+            {
+                yield-score: (if successful 
+                               (+ (get yield-score current-rep) u5)
+                               (if (> (get yield-score current-rep) u5)
+                                   (- (get yield-score current-rep) u2)
+                                   (get yield-score current-rep))),
+                successful-stakes: (if successful 
+                                     (+ (get successful-stakes current-rep) u1)
+                                     (get successful-stakes current-rep)),
+                total-stakes: (+ (get total-stakes current-rep) u1),
+                oasis-power: (get oasis-power current-rep),
+                category-expertise: (get category-expertise current-rep)
+            }
+        )
+        (ok true)
     )
 )
 
@@ -239,6 +263,18 @@
 
 (define-read-only (get-vault-count)
     (var-get vault-counter)
+)
+
+(define-read-only (get-vault-milestone (vault-id uint) (milestone-id uint))
+    (map-get? vault-milestones { vault-id: vault-id, milestone-id: milestone-id })
+)
+
+(define-read-only (get-collateral-vault (vault-id uint))
+    (map-get? collateral-vaults { vault-id: vault-id })
+)
+
+(define-read-only (get-oasis-farming-data (user principal) (category (string-ascii 50)))
+    (map-get? oasis-farming { user: user, category: category })
 )
 
 ;; Administrative functions
@@ -379,5 +415,165 @@
                 (merge vault { dune-against: (+ (get dune-against vault) total-dune-power) }))
         )
         
+        ;; Deduct DUNE tokens from user balance
+        (map-set dune-balances { user: tx-sender }
+            { balance: (- user-balance dune-committed) })
+        
         ;; Update oasis farming
-        (update-oasis-farming tx-sender (get category vault))
+        (unwrap-panic (update-oasis-farming tx-sender (get category vault)))
+        
+        (ok true)
+    )
+)
+
+;; Finalize vault voting
+(define-public (finalize-vault-voting (vault-id uint))
+    (let (
+        (vault (unwrap! (map-get? yield-vaults { vault-id: vault-id }) ERR-VAULT-NOT-FOUND))
+        (total-votes (+ (get dune-for vault) (get dune-against vault)))
+        (approval-percentage (if (> total-votes u0)
+                               (/ (* (get dune-for vault) u100) total-votes)
+                               u0))
+        (new-status (if (>= approval-percentage SUPERMAJORITY-THRESHOLD)
+                       STATUS-PASSED
+                       STATUS-REJECTED))
+    )
+        (asserts! (is-eq (get status vault) STATUS-ACTIVE) ERR-VAULT-NOT-ACTIVE)
+        (asserts! (> block-height (get staking-end-block vault)) ERR-STAKING-PERIOD-ENDED)
+        
+        (map-set yield-vaults { vault-id: vault-id }
+            (merge vault { status: new-status })
+        )
+        
+        (ok new-status)
+    )
+)
+
+;; Execute approved vault
+(define-public (execute-vault (vault-id uint))
+    (let (
+        (vault (unwrap! (map-get? yield-vaults { vault-id: vault-id }) ERR-VAULT-NOT-FOUND))
+        (collateral (unwrap! (map-get? collateral-vaults { vault-id: vault-id }) ERR-VAULT-NOT-FOUND))
+    )
+        (asserts! (is-eq (get status vault) STATUS-PASSED) ERR-VAULT-NOT-ACTIVE)
+        (asserts! (> block-height (get sandstorm-lock-end vault)) ERR-SANDSTORM-LOCK-ACTIVE)
+        (asserts! (is-eq (get execution-block vault) u0) ERR-VAULT-ALREADY-EXECUTED)
+        
+        ;; Transfer SAND from treasury to beneficiary (simplified)
+        (var-set total-sand-treasury (- (var-get total-sand-treasury) (get sand-requested vault)))
+        
+        ;; Mark vault as executed
+        (map-set yield-vaults { vault-id: vault-id }
+            (merge vault { status: STATUS-EXECUTED, execution-block: block-height })
+        )
+        
+        (ok true)
+    )
+)
+
+;; Milestone management
+(define-public (create-milestone 
+    (vault-id uint)
+    (milestone-id uint)
+    (description (string-ascii 200))
+    (amount uint))
+    (let (
+        (vault (unwrap! (map-get? yield-vaults { vault-id: vault-id }) ERR-VAULT-NOT-FOUND))
+        (collateral (unwrap! (map-get? collateral-vaults { vault-id: vault-id }) ERR-VAULT-NOT-FOUND))
+    )
+        (asserts! (is-eq tx-sender (get vault-creator vault)) ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq (get status vault) STATUS-EXECUTED) ERR-VAULT-NOT-ACTIVE)
+        (asserts! (is-none (map-get? vault-milestones { vault-id: vault-id, milestone-id: milestone-id })) ERR-MILESTONE-NOT-FOUND)
+        (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+        (asserts! (<= amount (- (get total-amount collateral) (get released-amount collateral))) ERR-INSUFFICIENT-BALANCE)
+        
+        (map-set vault-milestones { vault-id: vault-id, milestone-id: milestone-id }
+            {
+                description: description,
+                amount: amount,
+                completed: false,
+                verified-by-mirage: false,
+                completion-block: u0
+            }
+        )
+        
+        (map-set collateral-vaults { vault-id: vault-id }
+            (merge collateral { milestones-count: (+ (get milestones-count collateral) u1) })
+        )
+        
+        (ok true)
+    )
+)
+
+(define-public (complete-milestone (vault-id uint) (milestone-id uint))
+    (let (
+        (vault (unwrap! (map-get? yield-vaults { vault-id: vault-id }) ERR-VAULT-NOT-FOUND))
+        (milestone (unwrap! (map-get? vault-milestones { vault-id: vault-id, milestone-id: milestone-id }) ERR-MILESTONE-NOT-FOUND))
+    )
+        (asserts! (is-eq tx-sender (get vault-creator vault)) ERR-NOT-AUTHORIZED)
+        (asserts! (not (get completed milestone)) ERR-MILESTONE-ALREADY-COMPLETED)
+        
+        (map-set vault-milestones { vault-id: vault-id, milestone-id: milestone-id }
+            (merge milestone { completed: true, completion-block: block-height })
+        )
+        
+        (ok true)
+    )
+)
+
+(define-public (verify-milestone-by-oracle (vault-id uint) (milestone-id uint) (verified bool))
+    (let (
+        (milestone (unwrap! (map-get? vault-milestones { vault-id: vault-id, milestone-id: milestone-id }) ERR-MILESTONE-NOT-FOUND))
+    )
+        (asserts! (is-eq tx-sender (var-get mirage-oracle-address)) ERR-NOT-AUTHORIZED)
+        (asserts! (get completed milestone) ERR-INVALID-MILESTONE)
+        
+        (map-set vault-milestones { vault-id: vault-id, milestone-id: milestone-id }
+            (merge milestone { verified-by-mirage: verified })
+        )
+        
+        ;; Release funds if verified
+        (if verified
+            (let (
+                (collateral (unwrap! (map-get? collateral-vaults { vault-id: vault-id }) ERR-VAULT-NOT-FOUND))
+            )
+                (map-set collateral-vaults { vault-id: vault-id }
+                    (merge collateral { released-amount: (+ (get released-amount collateral) (get amount milestone)) })
+                )
+                (ok true)
+            )
+            (ok false)
+        )
+    )
+)
+
+;; Reward distribution for successful stakes
+(define-public (distribute-staking-rewards (vault-id uint))
+    (let (
+        (vault (unwrap! (map-get? yield-vaults { vault-id: vault-id }) ERR-VAULT-NOT-FOUND))
+        (user-stake (map-get? dune-stakes { vault-id: vault-id, staker: tx-sender }))
+    )
+        (asserts! (or (is-eq (get status vault) STATUS-PASSED) (is-eq (get status vault) STATUS-REJECTED)) ERR-VAULT-NOT-ACTIVE)
+        (asserts! (is-some user-stake) ERR-VAULT-NOT-FOUND)
+        
+        (let (
+            (stake (unwrap-panic user-stake))
+            (vault-passed (is-eq (get status vault) STATUS-PASSED))
+            (user-was-correct (is-eq (get stake-direction stake) vault-passed))
+            (dune-to-return (get dune-committed stake))
+            (user-balance (get-dune-balance tx-sender))
+        )
+            ;; Return staked DUNE tokens
+            (map-set dune-balances { user: tx-sender }
+                { balance: (+ user-balance dune-to-return) })
+            
+            ;; Update reputation based on correctness
+            (unwrap-panic (update-yield-reputation tx-sender user-was-correct))
+            
+            ;; Remove the stake record
+            (map-delete dune-stakes { vault-id: vault-id, staker: tx-sender })
+            
+            (ok user-was-correct)
+        )
+    )
+)
